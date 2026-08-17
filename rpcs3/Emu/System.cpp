@@ -422,6 +422,75 @@ extern void dump_executable(std::span<const u8> data, const ppu_module<lv2_obj>*
 	}
 }
 
+// Make games registered outside of /dev_hdd0/game visible to the real VSH.
+//
+// The normal game list can load games from arbitrary host folders, but VSH only
+// enumerates /dev_hdd0/game. Mounting the game's content directory at its title
+// id lets VSH read its PARAM.SFO, ICON0.PNG and EBOOT.BIN without copying or
+// modifying the user's game files. The mounts belong to the VSH process and are
+// discarded with its VFS when a selected game is launched.
+static void mount_xmb_game_directories(const games_config& games)
+{
+	std::set<std::string> mounted_title_ids;
+
+	for (const auto& [configured_title_id, configured_path] : games.get_games())
+	{
+		std::string game_path = configured_path;
+		fmt::trim_back(game_path, fs::delim);
+
+		// A trailing "/." marks a games.yml entry which points directly at a
+		// disc's PS3_GAME directory. It is a loader hint, not part of the path.
+		if (game_path.ends_with("/."))
+		{
+			game_path.resize(game_path.size() - 2);
+		}
+
+		// Each ISO needs its own virtual device, while VFS currently provides a
+		// single ISO device. Do not replace a user's mounted disc just to show it
+		// in the XMB.
+		if (game_path.empty() || is_iso_file(game_path))
+		{
+			continue;
+		}
+
+		const std::string game_dir = rpcs3::utils::get_sfo_dir_from_game_path(game_path, configured_title_id);
+		const psf::registry psf = psf::load_object(game_dir + "/PARAM.SFO");
+		const std::string title_id = std::string(psf::get_string(psf, "TITLE_ID"));
+
+		if (title_id.empty() || title_id.find_first_of("/\\") != umax)
+		{
+			sys_log.warning("Skipping invalid XMB game entry '%s': %s", configured_title_id, game_path);
+			continue;
+		}
+
+		if (!mounted_title_ids.emplace(title_id).second)
+		{
+			continue;
+		}
+
+		std::string elf;
+		if (Emulator::GetElfPathFromDir(elf, game_dir) != game_boot_result::no_errors)
+		{
+			sys_log.warning("Skipping non-bootable XMB game entry '%s': %s", title_id, game_dir);
+			continue;
+		}
+
+		const std::string virtual_path = "/dev_hdd0/game/" + title_id;
+
+		// Physical installations already appear in XMB. Never shadow them with
+		// an external library entry carrying the same title id.
+		if (fs::exists(vfs::get(virtual_path)))
+		{
+			continue;
+		}
+
+		if (vfs::mount(virtual_path, game_dir))
+		{
+			sys_log.notice("Made game '%s' available in XMB from '%s'", title_id, game_dir);
+		}
+	}
+}
+
 void Emulator::Init()
 {
 	// Log LLVM version
@@ -696,6 +765,11 @@ void Emulator::Init()
 			}
 #endif
 		}
+	}
+
+	if (m_path.ends_with("vsh.self") && IsPathInsideDir(m_path, g_cfg_vfs.get_dev_flash() + "vsh/module/"))
+	{
+		mount_xmb_game_directories(m_games_config);
 	}
 
 	make_path_verbose(fs::get_cache_dir() + "shaderlog/", false);
@@ -4945,3 +5019,4 @@ void Emulator::SaveSettings(std::string_view settings, const std::string& title_
 }
 
 Emulator Emu;
+
